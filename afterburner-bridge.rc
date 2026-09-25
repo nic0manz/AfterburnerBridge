@@ -1,0 +1,32 @@
+#include <windows.h>
+
+#define AB_VER      1,0,0,0
+#define AB_VER_STR  "1.0.0.0"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     AB_VER
+PRODUCTVERSION  AB_VER
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Afterburner Bridge"
+            VALUE "FileDescription",  "MSI Afterburner sensors for Corsair iCUE"
+            VALUE "FileVersion",      AB_VER_STR
+            VALUE "InternalName",     "AfterburnerBridge"
+            VALUE "OriginalFilename", "AfterburnerBridge.dll"
+            VALUE "ProductName",      "Afterburner Bridge"
+            VALUE "ProductVersion",   AB_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

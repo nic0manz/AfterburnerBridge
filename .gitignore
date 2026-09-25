@@ -1,0 +1,12 @@
+# build output
+*.o
+*.dll
+*.exe
+
+# runtime
+*.log
+
+# local backups
+*.orig
+*.bak
+*.zip
