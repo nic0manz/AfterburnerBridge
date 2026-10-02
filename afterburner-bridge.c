@@ -50,7 +50,7 @@
 #define AB_BASE          "AfterburnerBridge"
 #define DEVICE_ID_PREFIX "AFTERBURNER-BRIDGE"
 #define DEVICE_NAME      "Afterburner Bridge"
-#define AB_VERSION       "1.0"
+#define AB_VERSION       "1.1"
 
 /* Artwork file name prefix; see stub_getDeviceInfo. The installer puts
  * <IMAGE_PREFIX>-thumbnail.png and <IMAGE_PREFIX>-device_view.png next to
@@ -640,7 +640,10 @@ static const int32_t k_props[] = {
  * Monitoring tab and restarting iCUE is all it takes to publish it.
  */
 
-#define MAX_SENSORS 48
+/* Most entries published. Afterburner's entries are taken in its own order
+ * and the rest are left out, with a line in the log saying where it stopped.
+ * Not a setting: every sensor is one more thing iCUE polls continuously. */
+#define MAX_SENSORS 64
 
 typedef struct {
     char   name[64];    /* shown in iCUE, may carry the real unit      */
@@ -766,70 +769,84 @@ static double nvml_watts(void)
  * Nothing here is a hardcoded offset: the header gives the entry count and
  * size, and the string field length follows from (dwEntrySize - 24) / 5.
  * The three fields used are all ahead of `time`, whose width is ambiguous.
+ *
+ * The section is never held open between reads. A named section lives as
+ * long as anyone has a handle or a view on it, so a plugin that keeps it
+ * mapped keeps Afterburner's old section alive after Afterburner exits.
+ * When Afterburner starts again it gets that stale section back instead of
+ * a fresh one, and its RTCore.dll dies on an integer division by zero. So
+ * every read opens, maps, copies what it needs and lets go.
  */
 
 #define MAHM_SIG 0x4D41484DU   /* 'MAHM' as a multi-character constant */
 
-static HANDLE               mahm_map   = NULL;
-static const unsigned char *mahm_base  = NULL;
-static LONG                 mahm_state = 0;   /* 0 untried, 1 busy, 2 ready, 3 failed */
+typedef struct {
+    HANDLE               map;
+    const unsigned char *base;
+    uint32_t hsz, n, esz, slen;
+} MahmView;
 
-static void mahm_open(void)
+static void mahm_close(MahmView *v)
 {
-    if (InterlockedCompareExchange(&mahm_state, 1, 0) != 0) {
-        while (mahm_state == 1) Sleep(1);
-        return;
-    }
+    if (v->base) UnmapViewOfFile((LPCVOID)v->base);
+    if (v->map)  CloseHandle(v->map);
+    v->base = NULL; v->map = NULL;
+}
+
+/* Maps the section and checks the header. On success the caller owns the
+ * view and must hand it back with mahm_close, without keeping it past the
+ * current call. */
+static int mahm_view(MahmView *v)
+{
     /* The plugin container normally runs in the user's session, where the
      * plain name resolves. The prefixed names cover the case where it does
      * not. */
     static const char *names[] = {
         "MAHMSharedMemory", "Global\\MAHMSharedMemory", "Local\\MAHMSharedMemory"
     };
-    DWORD sess = 0;
-    ProcessIdToSessionId(GetCurrentProcessId(), &sess);
-    plog("MAHM: plugin container is in session %lu", (unsigned long)sess);
+    /* Only log changes, since this runs several times a second. */
+    static LONG last = -1;   /* -1 unknown, 0 unreachable, 1 open */
 
-    for (int i = 0; i < 3; i++) {
+    memset(v, 0, sizeof(*v));
+    const char *which = NULL;
+    for (int i = 0; i < 3 && !v->base; i++) {
         HANDLE h = OpenFileMappingA(FILE_MAP_READ, FALSE, names[i]);
-        if (!h) {
-            plog("MAHM: cannot open \"%s\" (error %lu)",
-                 names[i], (unsigned long)GetLastError());
-            continue;
-        }
+        if (!h) continue;
         const unsigned char *b =
             (const unsigned char *)MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0);
-        if (!b) {
-            plog("MAHM: cannot map \"%s\" (error %lu)",
-                 names[i], (unsigned long)GetLastError());
-            CloseHandle(h); continue;
-        }
-        mahm_map = h; mahm_base = b;
-        plog("MAHM: opened \"%s\", signature 0x%08X", names[i], *(const uint32_t *)b);
-        mahm_state = 2;
-        return;
+        if (!b) { CloseHandle(h); continue; }
+        v->map = h; v->base = b; which = names[i];
     }
-    plog("MAHM: shared memory not reachable - is Afterburner running?");
-    mahm_state = 3;
-}
 
-typedef struct {
-    const unsigned char *base;
-    uint32_t hsz, n, esz, slen;
-} MahmView;
+    if (!v->base) {
+        if (InterlockedExchange(&last, 0) != 0) {
+            DWORD sess = 0;
+            ProcessIdToSessionId(GetCurrentProcessId(), &sess);
+            plog("MAHM: shared memory not reachable from session %lu - is Afterburner running?",
+                 (unsigned long)sess);
+        }
+        return 0;
+    }
+    if (InterlockedExchange(&last, 1) != 1)
+        plog("MAHM: opened \"%s\", signature 0x%08X", which, *(const uint32_t *)v->base);
 
-static int mahm_view(MahmView *v)
-{
-    mahm_open();
-    if (mahm_state != 2 || !mahm_base) return 0;
-    const unsigned char *p = mahm_base;
-    if (*(const uint32_t *)p != MAHM_SIG) return 0;   /* Afterburner closed */
-    v->base = p;
+    const unsigned char *p = v->base;
+    /* 0xDEAD while Afterburner is shutting down, anything else while it is
+     * still filling the header in. */
+    if (*(const uint32_t *)p != MAHM_SIG) { mahm_close(v); return 0; }
     v->hsz  = *(const uint32_t *)(p + 0x08);
     v->n    = *(const uint32_t *)(p + 0x0C);
     v->esz  = *(const uint32_t *)(p + 0x10);
-    if (v->esz < 40 || v->n == 0 || v->n > 4096) return 0;
+    if (v->esz < 40 || v->n == 0 || v->n > 4096) { mahm_close(v); return 0; }
     v->slen = (v->esz - 24) / 5;
+
+    /* The header is Afterburner's word, the view size is the kernel's: never
+     * walk past the end of what is actually mapped. */
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        (uint64_t)v->hsz + (uint64_t)v->n * v->esz > (uint64_t)mbi.RegionSize) {
+        mahm_close(v); return 0;
+    }
     return 1;
 }
 
@@ -997,7 +1014,11 @@ static void sensors_ensure(void)
                  k, s->name, s->units, s->type, s->vmin, s->vmax,
                  s->is_int ? "integer" : "decimal", val);
             k++;
+            if (k == MAX_SENSORS && i + 1 < v.n)
+                plog("  limit of %d sensors reached, entries after \"%s\" are not published"
+                     " - untick some in Afterburner's Monitoring tab", MAX_SENSORS, nm);
         }
+        mahm_close(&v);
     }
 
     if (k == 0) {
@@ -1050,44 +1071,64 @@ static const char *device_id(void)
 }
 
 /* Values are cached briefly: the host polls often, and there is no point
- * re-reading shared memory for every call. */
+ * re-reading shared memory for every call. One refresh reads every sensor
+ * from a single mapping of the section, which is then released at once;
+ * see the note above MAHM_SIG. While Afterburner is closed the values read
+ * zero, and they come back on their own when it is started again. */
+static SRWLOCK g_val_lock = SRWLOCK_INIT;
+
 static double sensor_value(int idx)
 {
     static double    cache[MAX_SENSORS];
-    static ULONGLONG when[MAX_SENSORS];
+    static char      gone[MAX_SENSORS];   /* already logged as missing */
+    static ULONGLONG when = 0;
 
     sensors_ensure();
     if (idx < 0 || idx >= g_nsen) return 0.0;
 
+    AcquireSRWLockExclusive(&g_val_lock);
+
     ULONGLONG now = GetTickCount64();
-    if (when[idx] && now - when[idx] < 200) return cache[idx];
-
-    const Sensor *d = &g_sen[idx];
-    double v = 0.0;
-
-    if (d->slot < 0) {
-        v = nvml_watts();
-    } else {
+    if (!when || now - when >= 200) {
         MahmView mv;
-        if (mahm_view(&mv) && (uint32_t)d->slot < mv.n) {
-            const unsigned char *e = mahm_entry(&mv, (uint32_t)d->slot);
-            /* Afterburner may have reordered its entries since startup, so
-             * fall back to looking the name up. */
-            if (strcmp((const char *)e, d->src) != 0) {
-                e = NULL;
-                for (uint32_t i = 0; i < mv.n; i++) {
-                    const unsigned char *c = mahm_entry(&mv, i);
-                    if (strcmp((const char *)c, d->src) == 0) { e = c; break; }
+        int have = 0;
+        for (int i = 0; i < g_nsen; i++) if (g_sen[i].slot >= 0) have = 1;
+        int up = have && mahm_view(&mv);
+
+        for (int i = 0; i < g_nsen; i++) {
+            const Sensor *d = &g_sen[i];
+            double v = 0.0;
+            if (d->slot < 0) {
+                v = nvml_watts();
+            } else if (up) {
+                const unsigned char *e = NULL;
+                if ((uint32_t)d->slot < mv.n &&
+                    strcmp((const char *)mahm_entry(&mv, (uint32_t)d->slot), d->src) == 0)
+                    e = mahm_entry(&mv, (uint32_t)d->slot);
+                /* Afterburner may have reordered its entries since startup,
+                 * or been restarted with a different selection, so fall back
+                 * to looking the name up. */
+                for (uint32_t j = 0; !e && j < mv.n; j++) {
+                    const unsigned char *c = mahm_entry(&mv, j);
+                    if (strcmp((const char *)c, d->src) == 0) e = c;
                 }
-                if (!e) plog("\"%s\" is no longer exposed by Afterburner", d->src);
+                if (e) {
+                    v = mahm_sane(*(const float *)(e + 5 * (size_t)mv.slen));
+                    gone[i] = 0;
+                } else if (!gone[i]) {
+                    plog("\"%s\" is no longer exposed by Afterburner", d->src);
+                    gone[i] = 1;
+                }
             }
-            if (e) v = mahm_sane(*(const float *)(e + 5 * (size_t)mv.slen));
+            cache[i] = v;
         }
+        if (up) mahm_close(&mv);
+        when = now;
     }
 
-    cache[idx] = v;
-    when[idx]  = now;
-    return v;
+    double r = cache[idx];
+    ReleaseSRWLockExclusive(&g_val_lock);
+    return r;
 }
 
 static int datatype_for(int prop, int idx)
@@ -1119,10 +1160,14 @@ static int supported(int prop)
 
 /* Safety net. The host enumerates sensors by asking for higher and higher
  * indices, so a wrong count would have it spin. Reporting nothing beyond
- * the declared sensor count stops that, and the overall call budget is a
- * second line of defence. */
-#define CALL_BUDGET 20000
-static volatile LONG g_calls = 0;
+ * the declared sensor count stops that.
+ *
+ * There used to be a second line of defence, a cap on the total number of
+ * calls, after which every property was reported unsupported. The host
+ * polls every sensor continuously for as long as iCUE runs, so the cap was
+ * simply reached after a few minutes - sooner the more sensors there are -
+ * and the values vanished from iCUE until it was restarted. A lifetime cap
+ * cannot tell a spinning host from a healthy one, so it is gone. */
 
 static PropList *g_proplist = NULL;
 
@@ -1131,11 +1176,6 @@ static unsigned char stub_propInfo(const char *devId, int prop, int idx,
                                    void *outType, void *outFlags)
 {
     const char *who = (devId && readable(devId, 1)) ? devId : "?";
-
-    LONG n = InterlockedIncrement(&g_calls);
-    if (n == CALL_BUDGET)
-        plog("call budget reached; reporting every property as unsupported from now on");
-    if (n >= CALL_BUDGET) return 0;
 
     if (!supported(prop) ||
         (indexed_prop(prop) && (idx < 0 || idx >= sensor_count()))) {

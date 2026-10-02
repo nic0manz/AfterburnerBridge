@@ -1,7 +1,7 @@
 #include <windows.h>
 
-#define AB_VER      1,0,0,0
-#define AB_VER_STR  "1.0.0.0"
+#define AB_VER      1,1,0,0
+#define AB_VER_STR  "1.1.0.0"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION     AB_VER
